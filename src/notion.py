@@ -130,9 +130,9 @@ async def create_all_notion_pages_and_update_db(
         if not title:
             continue
 
-        created_page_obj = await Page.create_empty_page_in_database(
+        created_page_obj = await Page.create_empty_page_in_data_source(
             title=title,
-            database_name="Chapter",
+            data_source_name="Chapter",
             prop_d={"URL": URL[url]},
             do_open_url=False,
         )
@@ -245,9 +245,9 @@ async def upload_new_webpage_to_notion(
         url = get_url_from_page_id(page_id)
         leaf_icon_path = LocalPage.find_local_file_path_with_name("leaf", file_type="icon")
         icon = await UploadFile.from_local_file(leaf_icon_path, file_name_with_ext="leaf.png") if leaf_icon_path else None
-        created_page_obj = await Page.create_empty_page_in_database(
+        created_page_obj = await Page.create_empty_page_in_data_source(
             title=title,
-            database_name="Chapter",
+            data_source_name="Chapter",
             rel_d={"📚 Book": EVERGREEN_BOOK_ID},
             prop_d={"URL": URL[url]},
             icon=icon,

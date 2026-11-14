@@ -13,7 +13,7 @@ from uuid import UUID
 
 from psycopg2.extensions import connection as PgConnection
 
-from apis.notion.local_page import LocalPage
+from apis.notion.file_upload import upload_local_file
 from apis.notion.notional.blocks import (
     Block,
     Heading1,
@@ -23,15 +23,17 @@ from apis.notion.notional.blocks import (
     TextBlock,
     WithChildrenMixin,
 )
-from apis.notion.notional.parser import HtmlParser
 from apis.notion.notional.types import (
     MentionPage,
     Relation,
-    UploadFile,
     URL,
 )
 from apis.notion.page import Page
-from apis.notion.session import session
+from apis.notion.parser import HtmlParser
+from apis.notion.session import get_session
+from apis.notion.util import open_page_in_chrome
+from apis.postgres.file_utils import get_absolute_path_from_local_path
+from apis.postgres.query_executor import fetch_all
 
 from src.db import (
     get_all_page_id_and_notion_id_from_db,
@@ -87,11 +89,11 @@ def get_notion_blocks_from_html(
 
     for i, block in enumerate(block_l):
         if isinstance(block, Quote) and block.quote.children:
-            block_l[i] = Quote[block.quote.children[0].rich_text_]
+            block_l[i] = Quote.build(*block.quote.children[0].rich_text_)
         elif isinstance(block, Heading2):
-            block_l[i] = Heading1[block("rich_text")]
+            block_l[i] = Heading1.build(*block("rich_text"))
         elif isinstance(block, Heading3):
-            block_l[i] = Heading2[block("rich_text")]
+            block_l[i] = Heading2.build(*block("rich_text"))
 
     note_url_prefix = f"{NOTES_BASE_URL}/"
     for block in get_all_block_l_recursively(block_l):
@@ -107,7 +109,7 @@ def get_notion_blocks_from_html(
                     if not ref_notion_id:
                         logging.info(f"Skipping href '{text_block.plain_text}'")
                     else:
-                        block.rich_text_[j] = MentionPage[UUID(str(ref_notion_id))]
+                        block.rich_text_[j] = MentionPage.build(UUID(str(ref_notion_id)))
                         logging.info(f"Replacing href '{text_block.href}' with mention page '{ref_notion_id}'")
 
     return block_l
@@ -130,11 +132,10 @@ async def create_all_notion_pages_and_update_db(
         if not title:
             continue
 
-        created_page_obj = await Page.create_empty_page_in_data_source(
+        created_page_obj = await Page.create_in(
             title=title,
             data_source_name="Chapter",
-            prop_d={"URL": URL[url]},
-            do_open_url=False,
+            prop_d={"URL": URL.build(url)},
         )
         update_notion_id_in_db(page_id, created_page_obj.id, conn=conn)
 
@@ -160,12 +161,12 @@ async def upload_all_webpage_to_notion(
             html_content = file_path.read_text(encoding="utf-8")
             block_l = get_notion_blocks_from_html(html_content, conn=conn)
 
-            page_obj = await session.pages.retrieve(UUID(notion_id_str))
-            if len(page_obj._child_l) > 1:
+            page_obj = await Page.retrieve(UUID(notion_id_str))
+            if len(page_obj.content) > 1:
                 continue
 
-            page_obj._child_l = block_l
-            await page_obj.update_page()
+            page_obj.stage(children=block_l)
+            await page_obj.commit()
     finally:
         conn.close()
 
@@ -184,7 +185,7 @@ async def replace_href_with_mention_page_in_notion_page(
     target_url = get_url_from_page_id(href_id)
 
     page_obj = await Page.retrieve(target_page_uuid)
-    block_l = page_obj.get_page_flattened_block_l()
+    block_l = get_all_block_l_recursively(page_obj.content)
 
     updated_block_count = 0
     for block in block_l:
@@ -194,11 +195,11 @@ async def replace_href_with_mention_page_in_notion_page(
         block_modified = False
         for j, text_block in enumerate(block("rich_text")):
             if text_block.href and text_block.href == target_url:
-                block.rich_text_[j] = MentionPage[mention_uuid]
+                block.rich_text_[j] = MentionPage.build(mention_uuid)
                 block_modified = True
 
         if block_modified:
-            await session.blocks.update(block)
+            await get_session().blocks.update(block)
             updated_block_count += 1
 
     return updated_block_count
@@ -243,16 +244,17 @@ async def upload_new_webpage_to_notion(
         print("  Creating Notion page...")
 
         url = get_url_from_page_id(page_id)
-        leaf_icon_path = LocalPage.find_local_file_path_with_name("leaf", file_type="icon")
-        icon = await UploadFile.from_local_file(leaf_icon_path, file_name_with_ext="leaf.png") if leaf_icon_path else None
-        created_page_obj = await Page.create_empty_page_in_data_source(
+        leaf_icon_row_l = fetch_all("SELECT local_path FROM metadata.file WHERE id = %s AND type = 'icon'", (EVERGREEN_BOOK_ID,)) # the Evergreen book page's own leaf icon
+        icon = await upload_local_file(get_absolute_path_from_local_path(leaf_icon_row_l[0][0]), file_name_with_ext="leaf.png") if leaf_icon_row_l else None
+        created_page_obj = await Page.create_in(
             title=title,
             data_source_name="Chapter",
             rel_d={"📚 Book": EVERGREEN_BOOK_ID},
-            prop_d={"URL": URL[url]},
+            prop_d={"URL": URL.build(url)},
             icon=icon,
-            do_open_url=do_open_url,
         )
+        if do_open_url:
+            open_page_in_chrome(created_page_obj)
 
         notion_id = created_page_obj.id
         update_notion_id_in_db(page_id, notion_id, conn=conn)
@@ -265,7 +267,7 @@ async def upload_new_webpage_to_notion(
 
         html_content = file_path.read_text(encoding="utf-8")
         block_l = get_notion_blocks_from_html(html_content, conn=conn)
-        created_page_obj._child_l = block_l
+        created_page_obj.stage(children=block_l)
         print(f"  Appending {len(block_l)} blocks to the page...")
 
         child_page_l = get_child_page_l_with_notion_id(page_id, conn=conn)
@@ -275,10 +277,10 @@ async def upload_new_webpage_to_notion(
         unique_related_id_l = list(dict.fromkeys(child_notion_id_l + parent_notion_id_l))
 
         if unique_related_id_l:
-            created_page_obj._update_d["📖 Related"] = Relation[unique_related_id_l]
+            created_page_obj.stage({"📖 Related": Relation.build(*unique_related_id_l)})
             print(f'  Updating the "📖 Related" property of the new page with {len(unique_related_id_l)} related pages...')
 
-        await created_page_obj.process_update()
+        await created_page_obj.commit()
         print("  ✓ Updated the page\n")
 
         if parent_notion_id_l:

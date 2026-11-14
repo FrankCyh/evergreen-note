@@ -17,7 +17,7 @@ from apis.notion.notional.types import (
     Title,
 )
 from apis.notion.page import Page
-from apis.notion.session import session
+from apis.notion.session import get_session
 
 from src.notion import (
     get_all_block_l_recursively,
@@ -72,14 +72,14 @@ def test_get_notion_blocks_from_html_queries_postgres_db() -> None:
 async def test_replace_href_with_mention_page_traverses_nested_children(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parent_para = Paragraph["Top-level intro:"]
-    nested_bullet = BulletedListItem[
-        TextObject[
+    parent_para = Paragraph.build("Top-level intro:")
+    nested_bullet = BulletedListItem.build(
+        TextObject.build(
             "Spaced repetition memory prompts should be concise",
             None,
             f"{NOTES_BASE_URL}/z9vSQjkBVL6dCVC6QhCu4Br",
-        ]
-    ]
+        )
+    )
     parent_para.append(nested_bullet)
 
     all_block_l = get_all_block_l_recursively([parent_para])
@@ -88,7 +88,7 @@ async def test_replace_href_with_mention_page_traverses_nested_children(
 
     fake_page = Page(
         id=UUID("36a024dc-88c4-8129-bffe-f46b337e243c"),
-        properties={"Name": Title["Parent Page"]},
+        properties={"Name": Title.build("Parent Page")},
         content=[parent_para],
     )
 
@@ -97,7 +97,7 @@ async def test_replace_href_with_mention_page_traverses_nested_children(
 
     async def fake_retrieve(
         page_id: UUID,
-        do_dump: bool = False,
+        with_content: bool = True,
     ) -> Page:
         retrieved_uuid_l.append(page_id)
         return fake_page
@@ -109,7 +109,7 @@ async def test_replace_href_with_mention_page_traverses_nested_children(
         return block
 
     monkeypatch.setattr(Page, "retrieve", fake_retrieve)
-    monkeypatch.setattr(session.blocks, "update", fake_block_update)
+    monkeypatch.setattr(get_session().blocks, "update", fake_block_update)
 
     parent_page_id_str = "36a024dc-88c4-8129-bffe-f46b337e243c"
     new_page_uuid = UUID("11111111-2222-3333-4444-555555555555")

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import tempfile
 from pathlib import Path
 from typing import (
      Any,
@@ -11,6 +12,7 @@ from typing import (
 )
 from uuid import UUID
 
+import requests
 from psycopg2.extensions import connection as PgConnection
 
 from apis.notion.file_upload import upload_local_file
@@ -19,16 +21,21 @@ from apis.notion.notional.blocks import (
     Heading1,
     Heading2,
     Heading3,
-    Quote,
     TextBlock,
     WithChildrenMixin,
 )
+from apis.notion.notional.text import TextObject
 from apis.notion.notional.types import (
     MentionPage,
     Relation,
+    UploadFile,
     URL,
 )
 from apis.notion.page import Page
+from apis.notion.page_import import (
+    append_and_check_block_l,
+    upload_local_file_d,
+)
 from apis.notion.parser import HtmlParser
 from apis.notion.session import get_session
 from apis.notion.util import open_page_in_chrome
@@ -53,6 +60,7 @@ from src.webpage import (
 
 
 EVERGREEN_BOOK_ID = UUID("2ad024dc-88c4-8195-a7b8-dfdec7a6a8df")
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
 def get_all_block_l_recursively(
@@ -70,13 +78,46 @@ def get_all_block_l_recursively(
     return all_block_l
 
 
+def mark_author_heading(
+    heading: Block,
+) -> Block:
+    """
+    Start the heading's title with the author heading marker `>`, as a heading of the source: [[Project/apis/doc/apis/notion/source-import]]
+    """
+    rich_text_l = heading("rich_text")
+    if rich_text_l and isinstance(rich_text_l[0], TextObject):
+        rich_text_l[0].text.content = ">" + rich_text_l[0].text.content
+        rich_text_l[0].plain_text = ">" + rich_text_l[0].plain_text
+    else:
+        rich_text_l.insert(0, TextObject.build(">"))
+    return heading
+
+
+def lift_child_image(
+    block: Block,
+) -> List[Block]:
+    """
+    The block, then each image `HtmlParser` made its child from an `<img>` inside its text, so the image sits after its paragraph at the same level
+    """
+    if not isinstance(block, WithChildrenMixin) or not block("children"):
+        return [block]
+    image_l = [child for child in block("children") if child.type == "image"]
+    if not image_l:
+        return [block]
+    rest_l = [child for child in block("children") if child.type != "image"]
+    block().children = rest_l or None
+    block.has_children = bool(rest_l)
+    return [block, *image_l]
+
+
 def get_notion_blocks_from_html(
     html_content: str,
     conn: Optional[PgConnection] = None,
     page_id_to_notion_id_d: Optional[Dict[str, Optional[str]]] = None,
+    file_d: Optional[Dict[str, UploadFile]] = None,
 ) -> List[Block]:
     """
-    Parse Evergreen Note HTML into Notion blocks, normalize headings and quotes, and replace links to known Notion pages with `MentionPage`.
+    Parse Evergreen Note HTML into Notion blocks with each image's upload from `file_d`, keyed by its `src`; drop the title heading, raise the other headings one level and mark them as author headings, and replace links to known Notion pages with `MentionPage`.
     """
     html_content = re.sub(
         r'href="/([a-zA-Z0-9_-]+)"',
@@ -84,16 +125,15 @@ def get_notion_blocks_from_html(
         html_content,
     )
 
-    block_l = HtmlParser.parse_html_as_notion_block(html_content)
+    block_l = HtmlParser.parse_html_as_notion_block(html_content, file_d)
     block_l = [x for x in block_l if not isinstance(x, Heading1)]
+    block_l = [y for x in block_l for y in lift_child_image(x)]
 
     for i, block in enumerate(block_l):
-        if isinstance(block, Quote) and block.quote.children:
-            block_l[i] = Quote.build(*block.quote.children[0].rich_text_)
-        elif isinstance(block, Heading2):
-            block_l[i] = Heading1.build(*block("rich_text"))
+        if isinstance(block, Heading2):
+            block_l[i] = mark_author_heading(Heading1.build(*block("rich_text")))
         elif isinstance(block, Heading3):
-            block_l[i] = Heading2.build(*block("rich_text"))
+            block_l[i] = mark_author_heading(Heading2.build(*block("rich_text")))
 
     note_url_prefix = f"{NOTES_BASE_URL}/"
     for block in get_all_block_l_recursively(block_l):
@@ -113,6 +153,51 @@ def get_notion_blocks_from_html(
                         logging.info(f"Replacing href '{text_block.href}' with mention page '{ref_notion_id}'")
 
     return block_l
+
+
+def get_image_src_l_from_html(
+    html_content: str,
+) -> List[str]:
+    return re.findall(r'<img src="([^"]+)"', html_content)
+
+
+async def upload_note_image_file_d(
+    page_id: str,
+    html_content: str,
+) -> Dict[str, UploadFile]:
+    """
+    Upload each image of the saved note HTML `html_content` and map its `src` to the upload. The site moves its images, so each is downloaded from the same position in the note's live HTML; raises when the live note holds a different number of images, and the note must be crawled again.
+    """
+    saved_src_l = get_image_src_l_from_html(html_content)
+    if not saved_src_l:
+        return {}
+    response = requests.get(get_url_from_page_id(page_id), headers={"User-Agent": USER_AGENT}, timeout=30)
+    response.raise_for_status()
+    live_src_l = get_image_src_l_from_html(response.text)
+    assert len(live_src_l) == len(saved_src_l), f"Note {page_id} has {len(live_src_l)} images live and {len(saved_src_l)} saved: crawl it again"
+    with tempfile.TemporaryDirectory() as dir_path:
+        name_l = []
+        for i, live_src in enumerate(live_src_l):
+            image = requests.get(f"{NOTES_BASE_URL}/{live_src}", headers={"User-Agent": USER_AGENT}, timeout=60)
+            image.raise_for_status()
+            name = f"{i}-{live_src.rsplit('/', 1)[-1]}"
+            Path(dir_path, name).write_bytes(image.content)
+            name_l.append(name)
+        upload_d = await upload_local_file_d(dir_path, name_l)
+    return {saved_src: upload_d[name] for saved_src, name in zip(saved_src_l, name_l)}
+
+
+async def append_and_report_block_l(
+    notion_id: UUID,
+    block_l: List[Block],
+) -> None:
+    """
+    Append the note's blocks to its page, then print the page's block count and violations in local_notion
+    """
+    block_count, violation_l = await append_and_check_block_l(notion_id, block_l)
+    print(f"  ✓ Appended the blocks: {block_count} blocks in local_notion")
+    for violation in violation_l:
+        print(f"  ✗ {violation.rule}{' (auto-fix)' if violation.is_auto_fix else ''}: {violation.message}")
 
 
 async def create_all_notion_pages_and_update_db(
@@ -158,15 +243,13 @@ async def upload_all_webpage_to_notion(
             if not file_path.exists():
                 continue
 
-            html_content = file_path.read_text(encoding="utf-8")
-            block_l = get_notion_blocks_from_html(html_content, conn=conn)
-
             page_obj = await Page.retrieve(UUID(notion_id_str))
             if len(page_obj.content) > 1:
                 continue
 
-            page_obj.stage(children=block_l)
-            await page_obj.commit()
+            html_content = file_path.read_text(encoding="utf-8")
+            file_d = await upload_note_image_file_d(page_id, html_content)
+            await append_and_report_block_l(page_obj.id, get_notion_blocks_from_html(html_content, conn=conn, file_d=file_d))
     finally:
         conn.close()
 
@@ -266,9 +349,8 @@ async def upload_new_webpage_to_notion(
                 confirm = input("Initialized the page with the evergreen chapter template? (y/N): ").strip().lower()
 
         html_content = file_path.read_text(encoding="utf-8")
-        block_l = get_notion_blocks_from_html(html_content, conn=conn)
-        created_page_obj.stage(children=block_l)
-        print(f"  Appending {len(block_l)} blocks to the page...")
+        file_d = await upload_note_image_file_d(page_id, html_content)
+        block_l = get_notion_blocks_from_html(html_content, conn=conn, file_d=file_d)
 
         child_page_l = get_child_page_l_with_notion_id(page_id, conn=conn)
         parent_page_l = get_parent_page_l_with_notion_id(page_id, conn=conn)
@@ -281,7 +363,8 @@ async def upload_new_webpage_to_notion(
             print(f'  Updating the "📖 Related" property of the new page with {len(unique_related_id_l)} related pages...')
 
         await created_page_obj.commit()
-        print("  ✓ Updated the page\n")
+        print(f"  Appending {len(block_l)} blocks after the template's...")
+        await append_and_report_block_l(notion_id, block_l)
 
         if parent_notion_id_l:
             print("  Parent pages:")

@@ -15,6 +15,7 @@ from apis.notion.notional.text import TextObject
 from apis.notion.notional.types import (
     MentionObject,
     Title,
+    UploadFile,
 )
 from apis.notion.page import Page
 from apis.notion.session import get_session
@@ -46,7 +47,7 @@ def test_get_notion_blocks_from_html_replaces_known_links_with_mention_page() ->
     assert isinstance(block_l[2], Quote)
     assert isinstance(block_l[6], Divider)
     assert isinstance(block_l[7], Heading1)
-    assert block_l[7].plain_text_ == "References"
+    assert block_l[7].plain_text_ == ">References"
 
     mention_l = [
         rtf for rtf in block_l[0]("rich_text")
@@ -54,6 +55,24 @@ def test_get_notion_blocks_from_html_replaces_known_links_with_mention_page() ->
     ]
     assert len(mention_l) == 1
     assert mention_l[0].mention.page.id == UUID(child_notion_uuid)
+
+
+def test_get_notion_blocks_from_html_keeps_quote_paragraphs_and_uploads_images() -> None:
+    block_l = get_notion_blocks_from_html(
+        "<h2>Section</h2><blockquote><p>First</p><p>Second</p></blockquote><p>Text <img src=\"BearImages/a/b.png\"/></p>",
+        page_id_to_notion_id_d={},
+        file_d={"BearImages/a/b.png": UploadFile.build(UUID(int=1))},
+    )
+
+    assert isinstance(block_l[0], Heading1)
+    assert block_l[0].plain_text_ == ">Section"
+    assert isinstance(block_l[1], Quote)
+    assert block_l[1].plain_text_ == "First"
+    assert [child.plain_text_ for child in block_l[1].quote.children] == ["Second"]
+    assert block_l[2].plain_text_ == "Text"
+    assert not block_l[2].has_children
+    assert block_l[3].type == "image"
+    assert block_l[3].image.type == "file_upload"
 
 
 def test_get_notion_blocks_from_html_queries_postgres_db() -> None:
